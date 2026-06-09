@@ -2,44 +2,79 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build a Dockerfile.cuda13-equivalent x86_64 Conda environment for ArtiFixer.
+# Build an x86_64 Conda environment for ArtiFixer.
 #
 # Usage:
-#   bash scripts/setup_conda_cuda13_x86.sh [ENV_NAME]
+#   bash scripts/setup_conda_cuda13_x86.sh [--cu13] [ENV_NAME]
 #
-# Example:
-#   bash scripts/setup_conda_cuda13_x86.sh artifixer-cu13
+# Default mode reuses the system CUDA/PyTorch defaults and does not force the
+# CUDA13/cu130 stack. Pass --cu13 for the Dockerfile.cuda13-equivalent setup.
+#
+# Examples:
+#   bash scripts/setup_conda_cuda13_x86.sh arti
+#   bash scripts/setup_conda_cuda13_x86.sh --cu13 artifixer-cu13
 #   conda activate artifixer-cu13
 #   python tests/container_sanity_check.py
 #   python tests/test_flash_attn.py
 #
 # Useful overrides:
-#   PYTHON_VERSION=3.12                 # Dockerfile.cuda13 uses NGC py3.12
-#   CUDA_HOME=/usr/local/cuda-13.0
+#   PYTHON_VERSION=3.12
+#   CUDA_HOME=/usr/local/cuda-13.0       # used in --cu13 mode, or current CUDA_HOME otherwise
 #   CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh
-#   TORCH_VERSION=2.11.0
-#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+#   TORCH_VERSION=2.11.0                # --cu13 default; otherwise latest compatible torch
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130  # --cu13 default only
 #   FLASH_ATTN3_MODE=auto|source|skip   # auto tries binary first, then source
-#   FLASH_ATTN4_SPEC='flash-attn-4[cu13]'
+#   FLASH_ATTN4_SPEC='flash-attn-4[cu13]' # installed only with --cu13 unless overridden
 #   FLASH_ATTN_MAX_JOBS=16
 #   FLASH_ATTN_NVCC_THREADS=2
 #   RUN_SANITY=1                        # run tests/container_sanity_check.py at the end
 
 set -euo pipefail
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n "1,44p" "$0"
-  exit 0
-fi
+USE_CU13=0
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      sed -n "1,31p" "$0"
+      exit 0
+      ;;
+    --cu13)
+      USE_CU13=1
+      shift
+      ;;
+    --)
+      shift
+      POSITIONAL+=("$@")
+      break
+      ;;
+    -*)
+      printf "\n\033[1;31m[ERROR]\033[0m Unknown option: %s\n" "$1" >&2
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
 
-ENV_NAME="${1:-artifixer-cu13}"
+ENV_NAME="${1:-artifixer}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
+if [[ "$USE_CU13" == "1" ]]; then
+  CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
+  TORCH_VERSION="${TORCH_VERSION:-2.11.0}"
+  TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+  FLASH_ATTN4_SPEC="${FLASH_ATTN4_SPEC:-flash-attn-4[cu13]}"
+else
+  CUDA_HOME="${CUDA_HOME:-}"
+  TORCH_VERSION="${TORCH_VERSION:-}"
+  TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+  FLASH_ATTN4_SPEC="${FLASH_ATTN4_SPEC:-}"
+fi
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
-TORCH_VERSION="${TORCH_VERSION:-2.11.0}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
 FLASH_ATTN3_MODE="${FLASH_ATTN3_MODE:-auto}"
-FLASH_ATTN4_SPEC="${FLASH_ATTN4_SPEC:-flash-attn-4[cu13]}"
 FLASH_ATTN_MAX_JOBS="${FLASH_ATTN_MAX_JOBS:-16}"
 FLASH_ATTN_NVCC_THREADS="${FLASH_ATTN_NVCC_THREADS:-2}"
 RUN_SANITY="${RUN_SANITY:-0}"
@@ -55,14 +90,23 @@ require_cmd() {
 }
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
-  fatal "This script is for x86_64 CUDA13. Use Dockerfile.cuda13-aarch64 logic on ARM64."
+  fatal "This script is for x86_64. Use Dockerfile.cuda13-aarch64 logic on ARM64."
 fi
 
 [[ -f "$REPO_ROOT/Dockerfile.cuda13" ]] || fatal "Run from the ArtiFixer repo, or keep this script under scripts/. Missing $REPO_ROOT/Dockerfile.cuda13"
 [[ -d "$THREEDGRUT_ROOT" ]] || fatal "Missing submodule: $THREEDGRUT_ROOT. Run: git submodule update --init --recursive"
 [[ -f "$CONDA_SH" ]] || fatal "Cannot find conda shell hook: $CONDA_SH"
-[[ -d "$CUDA_HOME" ]] || fatal "CUDA_HOME does not exist: $CUDA_HOME"
-[[ -x "$CUDA_HOME/bin/nvcc" ]] || fatal "nvcc not found at $CUDA_HOME/bin/nvcc"
+if [[ "$USE_CU13" == "1" ]]; then
+  [[ -d "$CUDA_HOME" ]] || fatal "CUDA_HOME does not exist: $CUDA_HOME. Install CUDA13 first or set CUDA_HOME."
+  [[ -x "$CUDA_HOME/bin/nvcc" ]] || fatal "nvcc not found at $CUDA_HOME/bin/nvcc"
+else
+  if [[ -z "$CUDA_HOME" && -x /usr/local/cuda/bin/nvcc ]]; then
+    CUDA_HOME=/usr/local/cuda
+  fi
+  if [[ -n "$CUDA_HOME" && ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+    fatal "CUDA_HOME is set but nvcc is not executable at $CUDA_HOME/bin/nvcc"
+  fi
+fi
 
 for c in git curl wget gcc-11 g++-11; do require_cmd "$c"; done
 
@@ -96,9 +140,11 @@ export _ARTIFIXER_OLD_CUDA_HOME="\${CUDA_HOME:-}"
 export _ARTIFIXER_OLD_PATH="\${PATH:-}"
 export _ARTIFIXER_OLD_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}"
 export _ARTIFIXER_OLD_PYTHONPATH="\${PYTHONPATH:-}"
-export CUDA_HOME="$CUDA_HOME"
-export PATH="\$CUDA_HOME/bin:\$PATH"
-export LD_LIBRARY_PATH="\$CUDA_HOME/lib64:\${LD_LIBRARY_PATH:-}"
+if [[ -n "$CUDA_HOME" ]]; then
+  export CUDA_HOME="$CUDA_HOME"
+  export PATH="$CUDA_HOME/bin:\$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:\${LD_LIBRARY_PATH:-}"
+fi
 export CC=/usr/bin/gcc-11
 export CXX=/usr/bin/g++-11
 export TORCH_CUDA_ARCH_LIST="12.0;12.1"
@@ -129,14 +175,26 @@ print('CC', os.environ.get('CC'))
 print('CXX', os.environ.get('CXX'))
 print('TORCH_CUDA_ARCH_LIST', os.environ.get('TORCH_CUDA_ARCH_LIST'))
 PY
-nvcc --version | tail -4
+if [[ -n "$CUDA_HOME" ]]; then
+  nvcc --version | tail -4
+else
+  warn "CUDA_HOME not set; CUDA extensions may fail to build until CUDA is available"
+fi
 
 log "Installing conda build helpers (cmake, ninja)"
 conda install -y -c conda-forge cmake ninja
 
-log "Installing PyTorch $TORCH_VERSION from $TORCH_INDEX_URL"
 python -m pip install --upgrade pip setuptools wheel packaging
-python -m pip install "torch==$TORCH_VERSION" torchvision --index-url "$TORCH_INDEX_URL"
+if [[ -n "$TORCH_VERSION" && -n "$TORCH_INDEX_URL" ]]; then
+  log "Installing PyTorch $TORCH_VERSION from $TORCH_INDEX_URL"
+  python -m pip install "torch==$TORCH_VERSION" torchvision --index-url "$TORCH_INDEX_URL"
+elif [[ -n "$TORCH_VERSION" ]]; then
+  log "Installing PyTorch $TORCH_VERSION from default index"
+  python -m pip install "torch==$TORCH_VERSION" torchvision
+else
+  log "Installing PyTorch from default index"
+  python -m pip install torch torchvision
+fi
 python -m pip uninstall -y flash-attn flash-attn-3 flash_attn_3 opencv-python || true
 
 log "Installing 3DGRUT requirements and editable package"
@@ -202,11 +260,15 @@ case "$FLASH_ATTN3_MODE" in
     ;;
 esac
 
-log "Installing FA4 using prebuilt PyPI wheel: $FLASH_ATTN4_SPEC"
-python -m pip install --pre --only-binary=:all: "$FLASH_ATTN4_SPEC"
-# Dockerfile.cuda13 workaround: flash-attn-4 can pull a cuda-python 13.x namespace
-# stub missing cuda.bindings.driver on x86; pin the monolithic package used there.
-python -m pip install --force-reinstall --no-deps "cuda-python==12.6.2.post1"
+if [[ "$USE_CU13" == "1" ]]; then
+  log "Installing FA4 using prebuilt PyPI wheel: $FLASH_ATTN4_SPEC"
+  python -m pip install --pre --only-binary=:all: "$FLASH_ATTN4_SPEC"
+  # Dockerfile.cuda13 workaround: flash-attn-4 can pull a cuda-python 13.x namespace
+  # stub missing cuda.bindings.driver on x86; pin the monolithic package used there.
+  python -m pip install --force-reinstall --no-deps "cuda-python==12.6.2.post1"
+else
+  warn "Skipping FA4 CUDA13 wheel; pass --cu13 to install flash-attn-4[cu13]"
+fi
 
 log "Installing HuggingFace and ArtiFixer runtime/training dependencies"
 python -m pip install accelerate==1.13.0 diffusers==0.37.1 transformers==5.5.0 ftfy
