@@ -5,6 +5,7 @@
 """Sanity checks for the artifixer container."""
 
 import importlib
+import os
 import sys
 
 
@@ -48,11 +49,15 @@ print("\n=== FlashAttention ===")
 # when FA2 wheel is not separately installed — that's fine for H100/GB200 targets.
 check("flash_attn namespace", lambda: (__import__("flash_attn"), "importable (FA4 provides flash_attn.cute)")[1])
 
-# FA3 - check both the package and the interface module
+# FA3 - check both the package and the interface module.
+# A100/sm80 CUDA13 runs can intentionally skip FA3 and rely on FA4/PyTorch SDPA.
+fa3_required = os.environ.get("FLASH_ATTN3_MODE") != "skip"
 if not check("flash_attn_3 package", lambda: __import__("flash_attn_3").__name__):
-    failures += 1
+    if fa3_required:
+        failures += 1
 if not check("flash_attn_interface (FA3 API)", lambda: (__import__("flash_attn_interface"), "importable")[1]):
-    failures += 1
+    if fa3_required:
+        failures += 1
 
 # FA4
 fa4_ok = check("flash_attn.cute (FA4)", lambda: (importlib.import_module("flash_attn.cute"), "importable")[1])

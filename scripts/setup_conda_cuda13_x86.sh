@@ -22,7 +22,11 @@
 #   CUDA_HOME=/usr/local/cuda-13.0       # used in --cu13 mode, or current CUDA_HOME otherwise
 #   CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh
 #   TORCH_VERSION=2.11.0                # --cu13 default; otherwise latest compatible torch
-#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130  # --cu13 default only
+#   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+#   PIP_EXTRA_INDEX_URL=https://pypi.ngc.nvidia.com
+#   TORCH_INDEX_URL=$PIP_INDEX_URL      # default uses Tsinghua PyPI mirror
+#   TORCHVISION_VERSION=0.26.0          # default for TORCH_VERSION=2.11.0
+#   SLANGC_GITHUB_PROXY=https://ghfast.top/
 #   FLASH_ATTN3_MODE=auto|source|skip   # auto tries binary first, then source
 #   FLASH_ATTN4_SPEC='flash-attn-4[cu13]' # installed only with --cu13 unless overridden
 #   FLASH_ATTN_MAX_JOBS=16
@@ -62,15 +66,21 @@ set -- "${POSITIONAL[@]}"
 
 ENV_NAME="${1:-artifixer}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://pypi.ngc.nvidia.com}"
+SLANGC_GITHUB_PROXY="${SLANGC_GITHUB_PROXY:-https://ghfast.top/}"
+export SLANGC_GITHUB_PROXY
 if [[ "$USE_CU13" == "1" ]]; then
   CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
   TORCH_VERSION="${TORCH_VERSION:-2.11.0}"
-  TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+  TORCH_INDEX_URL="${TORCH_INDEX_URL:-$PIP_INDEX_URL}"
+  TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.26.0}"
   FLASH_ATTN4_SPEC="${FLASH_ATTN4_SPEC:-flash-attn-4[cu13]}"
 else
   CUDA_HOME="${CUDA_HOME:-}"
   TORCH_VERSION="${TORCH_VERSION:-}"
-  TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+  TORCH_INDEX_URL="${TORCH_INDEX_URL:-$PIP_INDEX_URL}"
+  TORCHVISION_VERSION="${TORCHVISION_VERSION:-}"
   FLASH_ATTN4_SPEC="${FLASH_ATTN4_SPEC:-}"
 fi
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
@@ -78,6 +88,7 @@ FLASH_ATTN3_MODE="${FLASH_ATTN3_MODE:-auto}"
 FLASH_ATTN_MAX_JOBS="${FLASH_ATTN_MAX_JOBS:-16}"
 FLASH_ATTN_NVCC_THREADS="${FLASH_ATTN_NVCC_THREADS:-2}"
 RUN_SANITY="${RUN_SANITY:-0}"
+TORCH_CUDA_ARCH_LIST_VALUE="${TORCH_CUDA_ARCH_LIST:-8.0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 THREEDGRUT_ROOT="$REPO_ROOT/thirdparty/3DGRUT-ArtiFixer"
 
@@ -96,6 +107,7 @@ fi
 [[ -f "$REPO_ROOT/Dockerfile.cuda13" ]] || fatal "Run from the ArtiFixer repo, or keep this script under scripts/. Missing $REPO_ROOT/Dockerfile.cuda13"
 [[ -d "$THREEDGRUT_ROOT" ]] || fatal "Missing submodule: $THREEDGRUT_ROOT. Run: git submodule update --init --recursive"
 [[ -f "$CONDA_SH" ]] || fatal "Cannot find conda shell hook: $CONDA_SH"
+REQUESTED_CUDA_HOME="$CUDA_HOME"
 if [[ "$USE_CU13" == "1" ]]; then
   [[ -d "$CUDA_HOME" ]] || fatal "CUDA_HOME does not exist: $CUDA_HOME. Install CUDA13 first or set CUDA_HOME."
   [[ -x "$CUDA_HOME/bin/nvcc" ]] || fatal "nvcc not found at $CUDA_HOME/bin/nvcc"
@@ -130,7 +142,12 @@ else
   conda create -y -n "$ENV_NAME" "python=$PYTHON_VERSION"
 fi
 
+set +u
 conda activate "$ENV_NAME"
+set -u
+if [[ -n "$REQUESTED_CUDA_HOME" ]]; then
+  CUDA_HOME="$REQUESTED_CUDA_HOME"
+fi
 
 # Runtime/compiler environment. Keep this in activate.d so later shells inherit it.
 log "Writing conda activation hooks"
@@ -147,7 +164,7 @@ if [[ -n "$CUDA_HOME" ]]; then
 fi
 export CC=/usr/bin/gcc-11
 export CXX=/usr/bin/g++-11
-export TORCH_CUDA_ARCH_LIST="12.0;12.1"
+export TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST_VALUE"
 export FORCE_CUDA=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONPATH="$REPO_ROOT:$THREEDGRUT_ROOT:\${PYTHONPATH:-}"
@@ -162,7 +179,10 @@ unset CC CXX TORCH_CUDA_ARCH_LIST FORCE_CUDA PYTORCH_CUDA_ALLOC_CONF
 EOF
 # Apply current activation hook immediately.
 # shellcheck source=/dev/null
+set +u
 source "$CONDA_PREFIX/etc/conda/activate.d/artifixer_cuda13.sh"
+set -u
+export PIP_INDEX_URL PIP_EXTRA_INDEX_URL
 
 log "Environment summary"
 python - <<'PY'
@@ -184,16 +204,39 @@ fi
 log "Installing conda build helpers (cmake, ninja)"
 conda install -y -c conda-forge cmake ninja
 
-python -m pip install --upgrade pip setuptools wheel packaging
-if [[ -n "$TORCH_VERSION" && -n "$TORCH_INDEX_URL" ]]; then
-  log "Installing PyTorch $TORCH_VERSION from $TORCH_INDEX_URL"
-  python -m pip install "torch==$TORCH_VERSION" torchvision --index-url "$TORCH_INDEX_URL"
-elif [[ -n "$TORCH_VERSION" ]]; then
-  log "Installing PyTorch $TORCH_VERSION from default index"
-  python -m pip install "torch==$TORCH_VERSION" torchvision
+python -m pip install --upgrade pip "setuptools<82" wheel packaging
+TORCHVISION_SPEC="torchvision"
+if [[ -n "${TORCHVISION_VERSION:-}" ]]; then
+  TORCHVISION_SPEC="torchvision==$TORCHVISION_VERSION"
+fi
+if python - "$TORCH_VERSION" "$TORCHVISION_VERSION" <<'PYTORCHCHECK'
+import sys
+want_torch, want_tv = sys.argv[1], sys.argv[2]
+try:
+    import torch, torchvision
+except Exception:
+    raise SystemExit(1)
+ok = True
+if want_torch:
+    ok = ok and torch.__version__.split('+', 1)[0] == want_torch
+if want_tv:
+    ok = ok and torchvision.__version__.split('+', 1)[0] == want_tv
+print('existing torch', torch.__version__, 'torchvision', torchvision.__version__)
+raise SystemExit(0 if ok else 1)
+PYTORCHCHECK
+then
+  log "Reusing existing matching PyTorch/Torchvision install"
 else
-  log "Installing PyTorch from default index"
-  python -m pip install torch torchvision
+  if [[ -n "$TORCH_VERSION" && -n "$TORCH_INDEX_URL" ]]; then
+    log "Installing PyTorch $TORCH_VERSION from $TORCH_INDEX_URL (pip mirror: $PIP_INDEX_URL)"
+    python -m pip install --no-cache-dir "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" --index-url "$TORCH_INDEX_URL"
+  elif [[ -n "$TORCH_VERSION" ]]; then
+    log "Installing PyTorch $TORCH_VERSION from pip mirror: $PIP_INDEX_URL"
+    python -m pip install --no-cache-dir "torch==$TORCH_VERSION" "$TORCHVISION_SPEC"
+  else
+    log "Installing PyTorch from pip mirror: $PIP_INDEX_URL"
+    python -m pip install --no-cache-dir torch "$TORCHVISION_SPEC"
+  fi
 fi
 python -m pip uninstall -y flash-attn flash-attn-3 flash_attn_3 opencv-python || true
 
@@ -206,6 +249,27 @@ REQ_NO_FUSED="/tmp/artifixer_3dgrut_requirements_no_fused_ssim.txt"
 grep -v 'git+https://github.com/rahul-goel/fused-ssim' requirements.txt > "$REQ_NO_FUSED"
 python -m pip install -r "$REQ_NO_FUSED"
 python -m pip install --no-build-isolation "fused_ssim @ git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157"
+# 3DGRUT's install_slangc.sh downloads directly from GitHub. On machines where
+# GitHub release assets are slow, pre-fill the exact tarball path it expects
+# using an optional proxy or explicit mirror URL, then let the upstream script
+# do its normal version check and extraction.
+SLANGC_VERSION="${SLANGC_VERSION:-2026.5.2}"
+case "$(uname -m)" in
+  x86_64|amd64) SLANGC_ARCH="x86_64" ;;
+  aarch64|arm64) SLANGC_ARCH="aarch64" ;;
+  *) fatal "Unsupported platform for slangc: $(uname -m)" ;;
+esac
+SLANGC_TARBALL="/tmp/slang-${SLANGC_VERSION}-linux-${SLANGC_ARCH}.tar.gz"
+SLANGC_UPSTREAM_URL="https://github.com/shader-slang/slang/releases/download/v${SLANGC_VERSION}/slang-${SLANGC_VERSION}-linux-${SLANGC_ARCH}.tar.gz"
+if [[ ! -f "$SLANGC_TARBALL" ]]; then
+  if [[ -n "${SLANGC_DOWNLOAD_URL:-}" ]]; then
+    log "Downloading slangc via SLANGC_DOWNLOAD_URL"
+    wget -O "$SLANGC_TARBALL" "$SLANGC_DOWNLOAD_URL"
+  elif [[ -n "${SLANGC_GITHUB_PROXY:-}" ]]; then
+    log "Downloading slangc via proxy: $SLANGC_GITHUB_PROXY"
+    wget -O "$SLANGC_TARBALL" "${SLANGC_GITHUB_PROXY}${SLANGC_UPSTREAM_URL}"
+  fi
+fi
 bash scripts/install_slangc.sh "$CONDA_PREFIX"
 python -m pip install -e .
 
@@ -280,17 +344,22 @@ python -m pip install \
 log "Smoke imports matching Dockerfile.cuda13"
 cd "$REPO_ROOT"
 python - <<'PY'
-import importlib, torch
+import importlib, os, torch
 print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available())
 if torch.cuda.is_available():
     print('gpu', torch.cuda.get_device_name(0), 'cap', torch.cuda.get_device_capability(0))
-for mod in ['flash_attn_interface', 'flash_attn_3', 'cv2', 'diffusers', 'transformers', 'accelerate', 'threedgrut']:
+mods = ['cv2', 'diffusers', 'transformers', 'accelerate', 'threedgrut']
+if os.environ.get('FLASH_ATTN3_MODE') != 'skip':
+    mods[:0] = ['flash_attn_interface', 'flash_attn_3']
+for mod in mods:
     importlib.import_module(mod)
     print(mod, 'ok')
 from moge.model.v2 import MoGeModel
 print('MoGe ok')
 PY
-python -m pip show flash-attn-4 | grep Version && echo 'FA4 ok'
+if [[ "$USE_CU13" == "1" ]]; then
+  python -m pip show flash-attn-4 | grep Version && echo 'FA4 ok'
+fi
 
 if [[ "$RUN_SANITY" == "1" ]]; then
   log "Running tests/container_sanity_check.py"
