@@ -8,12 +8,25 @@ single input video instead of a prepared evalset. Internally it chunks the video
 chunks, trims padding from the last chunk, then stitches the enhanced frames back
 to a full-length MP4.
 
-Example:
+It can also process a directory of numbered trajectory folders, e.g. a DiffAero
+``trajs`` directory containing ``0/rgb.mp4``, ``1/rgb.mp4``, ... . In batch mode
+intermediate files are kept in each trajectory's hidden work directory while the
+final enhanced videos are copied next to the source ``rgb.mp4``.
+
+Examples:
     python -m model_eval.run_video_inference \
         --video /path/to/input.mp4 \
         --checkpoint_pt /path/to/artifixer-14b.pt \
         --model_id /path/to/Wan2.1-T2V-14B-Diffusers \
         --save_dir /path/to/output \
+        --num_views 12 \
+        --output_fps 30 \
+        --replace_if_exists
+
+    python -m model_eval.run_video_inference \
+        --video_dir /path/to/trajs \
+        --checkpoint_pt /path/to/artifixer-14b.pt \
+        --model_id /path/to/Wan2.1-T2V-14B-Diffusers \
         --num_views 12 \
         --output_fps 30 \
         --replace_if_exists
@@ -23,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 
@@ -49,9 +63,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = get_eval_common_opts()
     add_checkpoint_args(parser)
 
-    # New video input. Everything else intentionally resembles run_inference.py.
-    parser.add_argument("--video", type=Path, required=True, help="Input MP4/video to enhance with ArtiFixer")
-    parser.add_argument("--save_dir", type=Path, required=True, help="Directory for prepared chunks, ArtiFixer outputs, and stitched videos")
+    # New video inputs. Everything else intentionally resembles run_inference.py.
+    inputs = parser.add_argument_group("arbitrary video inputs")
+    inputs.add_argument("--video", type=Path, default=None, help="Input MP4/video to enhance with ArtiFixer")
+    inputs.add_argument(
+        "--video_dir",
+        type=Path,
+        default=None,
+        help="Directory containing numeric subdirectories with a video file, e.g. trajs/0/rgb.mp4, trajs/1/rgb.mp4",
+    )
+    inputs.add_argument("--video_name", default="rgb.mp4", help="Video filename to read inside each numeric --video_dir child")
+    inputs.add_argument("--max_videos", type=int, default=None, help="Optional batch-mode limit for smoke tests")
+
+    outputs = parser.add_argument_group("arbitrary video outputs")
+    outputs.add_argument("--save_dir", type=Path, default=None, help="Single-video working/output directory for prepared chunks, ArtiFixer outputs, and stitched videos")
+    outputs.add_argument("--work_dir_name", default=".artifixer_work", help="Batch-mode hidden work directory created inside each numeric child")
+    outputs.add_argument("--enhanced_name", default="rgb_artifixer.mp4", help="Batch-mode enhanced video filename copied next to the source video")
+    outputs.add_argument("--comparison_name", default="rgb_before_after_artifixer.mp4", help="Batch-mode side-by-side video filename copied next to the source video")
+    outputs.add_argument("--continue_on_error", action="store_true", help="Batch mode: keep processing later videos if one fails")
 
     parser.add_argument("--num_views", default=12, type=int, help="Number of context views per chunk")
     parser.add_argument("--output_fps", default=None, type=int, help="Output FPS. Defaults to input video's FPS")
@@ -90,6 +119,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_checkpoint_args(parser, args)
+    if (args.video is None) == (args.video_dir is None):
+        parser.error("Specify exactly one of --video or --video_dir")
+    if args.video is not None and args.save_dir is None:
+        parser.error("--save_dir is required with --video")
+    if args.video_dir is not None and args.save_dir is not None:
+        parser.error("--save_dir is single-video only; batch mode writes to <numeric_child>/<work_dir_name>")
     if args.checkpoint_dir is not None:
         parser.error("run_video_inference currently supports --checkpoint_pt only; export checkpoint_dir to .pt first")
     if args.context_parallel_size != 1:
@@ -97,7 +132,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.save_frame_outputs_only:
         parser.error("--save_frame_outputs_only is not supported because stitching needs pred frames and videos")
     if args.output_suffix:
-        parser.error("--output_suffix is not supported in arbitrary-video mode; choose a different --save_dir")
+        parser.error("--output_suffix is not supported in arbitrary-video mode; choose a different --save_dir or batch output names")
     if args.max_neighbors_per_encode is not None and args.max_neighbors_per_encode <= 0:
         parser.error("--max_neighbors_per_encode must be positive when set")
     if args.chunk_frames is not None:
@@ -106,15 +141,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--bidirectional_chunk_size / --chunk_frames must be positive")
     if args.num_views <= 0:
         parser.error("--num_views must be positive")
+    if args.max_videos is not None and args.max_videos <= 0:
+        parser.error("--max_videos must be positive when set")
     return args
 
 
-def main(args: argparse.Namespace) -> None:
-    runner = _load_chunk_runner()
-    scene_prefix = args.scene_id or "chunk"
+def _run_chunk_runner(runner, args: argparse.Namespace, *, video: Path, save_dir: Path, scene_prefix: str) -> tuple[Path, Path | None]:
     runner_args = [
-        "--video", str(args.video),
-        "--work_dir", str(args.save_dir),
+        "--video", str(video),
+        "--work_dir", str(save_dir),
         "--artifixer_repo", str(_repo_root()),
         "--python", sys.executable,
         "--model_id", str(args.model_id),
@@ -142,6 +177,89 @@ def main(args: argparse.Namespace) -> None:
         runner.main()
     finally:
         sys.argv = old_argv
+
+    enhanced = save_dir / "stitched" / "enhanced_full.mp4"
+    comparison = None if args.no_comparison else save_dir / "stitched" / "before_after_hstack_full.mp4"
+    if not enhanced.is_file():
+        raise FileNotFoundError(f"Expected enhanced video was not created: {enhanced}")
+    if comparison is not None and not comparison.is_file():
+        raise FileNotFoundError(f"Expected comparison video was not created: {comparison}")
+    return enhanced, comparison
+
+
+def _numeric_video_jobs(video_dir: Path, video_name: str, max_videos: int | None) -> list[tuple[Path, Path]]:
+    if not video_dir.is_dir():
+        raise NotADirectoryError(video_dir)
+    jobs: list[tuple[Path, Path]] = []
+    for child in sorted((p for p in video_dir.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: int(p.name)):
+        video = child / video_name
+        if video.is_file():
+            jobs.append((child, video))
+            if max_videos is not None and len(jobs) >= max_videos:
+                break
+        else:
+            print(f"Skipping {child}: missing {video_name}", flush=True)
+    if not jobs:
+        raise FileNotFoundError(f"No numeric child directories containing {video_name} found under {video_dir}")
+    return jobs
+
+
+def _copy_batch_outputs(args: argparse.Namespace, *, enhanced: Path, comparison: Path | None, traj_dir: Path) -> tuple[Path, Path | None]:
+    enhanced_out = traj_dir / args.enhanced_name
+    comparison_out = None if comparison is None else traj_dir / args.comparison_name
+    targets = [enhanced_out]
+    if comparison_out is not None:
+        targets.append(comparison_out)
+    existing = [p for p in targets if p.exists()]
+    if existing and not args.replace_if_exists:
+        raise FileExistsError(
+            "Refusing to overwrite existing batch output(s) without --replace_if_exists: "
+            + ", ".join(str(p) for p in existing)
+        )
+    shutil.copy2(enhanced, enhanced_out)
+    if comparison is not None and comparison_out is not None:
+        shutil.copy2(comparison, comparison_out)
+    return enhanced_out, comparison_out
+
+
+def _run_single(args: argparse.Namespace, runner) -> None:
+    scene_prefix = args.scene_id or "chunk"
+    enhanced, comparison = _run_chunk_runner(runner, args, video=args.video, save_dir=args.save_dir, scene_prefix=scene_prefix)
+    print("Enhanced:", enhanced, flush=True)
+    if comparison:
+        print("Comparison:", comparison, flush=True)
+
+
+def _run_batch(args: argparse.Namespace, runner) -> None:
+    jobs = _numeric_video_jobs(args.video_dir, args.video_name, args.max_videos)
+    print(f"Found {len(jobs)} video(s) in numeric child directories under {args.video_dir}", flush=True)
+    failures: list[tuple[Path, BaseException]] = []
+    for idx, (traj_dir, video) in enumerate(jobs, start=1):
+        print(f"[{idx}/{len(jobs)}] Enhancing {video}", flush=True)
+        try:
+            work_dir = traj_dir / args.work_dir_name
+            scene_prefix = args.scene_id or f"{traj_dir.name}_chunk"
+            enhanced, comparison = _run_chunk_runner(runner, args, video=video, save_dir=work_dir, scene_prefix=scene_prefix)
+            enhanced_out, comparison_out = _copy_batch_outputs(args, enhanced=enhanced, comparison=comparison, traj_dir=traj_dir)
+            print("Enhanced:", enhanced_out, flush=True)
+            if comparison_out:
+                print("Comparison:", comparison_out, flush=True)
+        except BaseException as exc:  # noqa: BLE001 - report and optionally continue for long batch jobs.
+            if not args.continue_on_error:
+                raise
+            failures.append((video, exc))
+            print(f"FAILED {video}: {exc}", flush=True)
+    if failures:
+        details = "\n".join(f"  {video}: {exc}" for video, exc in failures)
+        raise RuntimeError(f"{len(failures)} batch video(s) failed:\n{details}")
+
+
+def main(args: argparse.Namespace) -> None:
+    runner = _load_chunk_runner()
+    if args.video_dir is not None:
+        _run_batch(args, runner)
+    else:
+        _run_single(args, runner)
 
 
 if __name__ == "__main__":
