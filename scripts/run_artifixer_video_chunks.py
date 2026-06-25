@@ -255,6 +255,12 @@ def main() -> None:
     parser.add_argument("--replace_if_exists", action="store_true")
     parser.add_argument("--skip_inference", action="store_true", help="Only prepare split/chunks and stitch existing outputs")
     parser.add_argument("--no_comparison", action="store_true")
+    parser.add_argument(
+        "--max_neighbors_per_encode",
+        type=int,
+        default=None,
+        help="Max neighbor frames to VAE-encode at once; use 1 on memory-constrained GPUs",
+    )
     args = parser.parse_args()
 
     args.video = args.video.resolve()
@@ -311,6 +317,8 @@ def main() -> None:
         ]
         if args.replace_if_exists:
             cmd.append("--replace_if_exists")
+        if args.max_neighbors_per_encode is not None:
+            cmd.extend(["--max_neighbors_per_encode", str(args.max_neighbors_per_encode)])
         run(cmd, cwd=args.artifixer_repo, env=env)
 
     mode_dir = output_mode_dir(infer_save_dir, args.checkpoint_pt, args.num_views, args.sink_size)

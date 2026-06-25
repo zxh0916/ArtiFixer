@@ -169,6 +169,8 @@ def _run_chunk_runner(runner, args: argparse.Namespace, *, video: Path, save_dir
         runner_args.append("--skip_inference")
     if args.no_comparison:
         runner_args.append("--no_comparison")
+    if args.max_neighbors_per_encode is not None:
+        runner_args.extend(["--max_neighbors_per_encode", str(args.max_neighbors_per_encode)])
 
     # Reuse the chunk runner's tested implementation while exposing a run_inference-like CLI.
     old_argv = sys.argv
